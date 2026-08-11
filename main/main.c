@@ -14,6 +14,7 @@
 
 #include "esp_err.h"
 #include "esp_check.h"
+#include "esp_cache.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -36,6 +37,7 @@
 #endif
 
 #define BUFFER_COUNT        2
+#define P4SCAN_FW_MARK      "raw8-1024x600-psram20-20260811"
 
 typedef struct {
     int cap_fd;
@@ -429,6 +431,12 @@ static uvc_fb_t *video_fb_get_cb(void *cb_ctx)
     cap_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     cap_buf.memory = V4L2_MEMORY_MMAP;
     ESP_ERROR_CHECK(ioctl(uvc->cap_fd, VIDIOC_DQBUF, &cap_buf));
+    ESP_ERROR_CHECK(esp_cache_msync(uvc->cap_buffer[cap_buf.index], cap_buf.bytesused, ESP_CACHE_MSYNC_FLAG_DIR_M2C));
+    if (frame_count < 8) {
+        ESP_LOGI(TAG, "camera frame: index=%u bytesused=%u",
+                 (unsigned int)cap_buf.index,
+                 (unsigned int)cap_buf.bytesused);
+    }
 #endif
 
     memset(&m2m_out_buf, 0, sizeof(m2m_out_buf));
@@ -436,6 +444,8 @@ static uvc_fb_t *video_fb_get_cb(void *cb_ctx)
     m2m_out_buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
     m2m_out_buf.memory = V4L2_MEMORY_USERPTR;
 #if CONFIG_P4SCAN_UVC_TEST_PATTERN
+    ESP_ERROR_CHECK(esp_cache_msync(uvc->pattern_buffer, uvc->pattern_len,
+                                    ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED));
     m2m_out_buf.m.userptr = (unsigned long)uvc->pattern_buffer;
     m2m_out_buf.length = uvc->pattern_len;
 #else
@@ -524,7 +534,7 @@ static esp_err_t init_uvc(p4_uvc_t *uvc)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "ESP32-P4 SC2336 USB camera starting");
+    ESP_LOGI(TAG, "ESP32-P4 SC2336 USB camera starting, fw=%s", P4SCAN_FW_MARK);
 
     p4_uvc_t *uvc = calloc(1, sizeof(p4_uvc_t));
     assert(uvc);

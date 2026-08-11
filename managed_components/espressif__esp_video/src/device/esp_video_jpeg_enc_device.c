@@ -151,12 +151,6 @@ static esp_err_t jpeg_video_m2m_process(struct esp_video *video, uint8_t *src, u
         .height = M2M_VIDEO_GET_OUTPUT_FORMAT_HEIGHT(video),
     };
 
-    ret = esp_cache_msync(src, src_size, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "failed to write back JPEG source buffer");
-        return ret;
-    }
-
     ret = esp_cache_msync(dst, dst_size, ESP_CACHE_MSYNC_FLAG_DIR_M2C);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "failed to invalidate JPEG destination buffer before encoding");
