@@ -1,0 +1,39 @@
+menu "Example Configuration"
+
+    config P4SCAN_UVC_TEST_PATTERN
+        bool "Stream generated RGB565 test pattern instead of camera"
+        default n
+        help
+            Generate a 1920x1080 RGB565 test pattern and send it through the
+            same hardware JPEG encoder and UVC path. This is useful to isolate
+            UVC/JPEG transport issues from camera/ISP capture issues.
+
+    if FORMAT_MJPEG_CAM1
+        config EXAMPLE_JPEG_COMPRESSION_QUALITY
+            int "JPEG compression quality (%)"
+            default 80
+            range 1 100
+    endif
+
+    if FORMAT_H264_CAM1
+        config EXAMPLE_H264_I_PERIOD
+            int "H.264 Intra Frame period (frames)"
+            default 120
+            range 1 120
+
+        config EXAMPLE_H264_BITRATE
+            int "H.264 Target bitrate (bps)"
+            default 1000000
+            range 25000 2500000
+
+        config EXAMPLE_H264_MIN_QP
+            int "H.264 Minimum quantization parameter (QP)"
+            default 25
+            range 1 51
+
+        config EXAMPLE_H264_MAX_QP
+            int "H.264 Maximum quantization parameter (QP)"
+            default 26
+            range 1 51
+    endif
+endmenu

@@ -1,0 +1,7 @@
+build/
+managed_components/
+.deps/
+.vscode/
+sdkconfig
+sdkconfig.old
+*.log
