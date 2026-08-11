@@ -1183,18 +1183,18 @@ static const esp_cam_sensor_format_t sc2336_format_info_mipi[] = {
 #endif
 #if CONFIG_CAMERA_SC2336_MIPI_RAW10_1920X1080_25FPS_2_LANE
     {
-        .name = "MIPI_2lane_24Minput_RAW10_1920x1080_15fps",
+        .name = "MIPI_2lane_24Minput_RAW10_1920x1080_25fps",
         .format = ESP_CAM_SENSOR_PIXFORMAT_RAW10,
         .port = ESP_CAM_SENSOR_MIPI_CSI,
         .xclk = 24000000,
         .width = 1920,
         .height = 1080,
-        .regs = sc2336_mipi_2lane_24Minput_1920x1080_raw10_15fps,
-        .regs_size = ARRAY_SIZE(sc2336_mipi_2lane_24Minput_1920x1080_raw10_15fps),
-        .fps = 15,
+        .regs = sc2336_mipi_2lane_24Minput_1920x1080_raw10_25fps,
+        .regs_size = ARRAY_SIZE(sc2336_mipi_2lane_24Minput_1920x1080_raw10_25fps),
+        .fps = 25,
         .isp_info = &sc2336_isp_info_mipi[4],
         .mipi_info = {
-            .mipi_clk = 405000000,
+            .mipi_clk = 330000000,
             .lane_num = 2,
             .line_sync_en = false,
         },

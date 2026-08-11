@@ -6,10 +6,12 @@
 
 #include <assert.h>
 #include <fcntl.h>
+#include <stdbool.h>
 #include <string.h>
 #include <sys/errno.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <unistd.h>
 #include <sys/param.h>
 
 #include "esp_err.h"
@@ -19,6 +21,8 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "example_video_common.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "usb_device_uvc.h"
 #include "uvc_frame_config.h"
 
@@ -37,17 +41,22 @@
 #endif
 
 #define BUFFER_COUNT        2
-#define P4SCAN_FW_MARK      "raw8-1024x600-psram20-20260811"
+#define P4SCAN_FW_MARK      "raw10-640x480-uvc-abortreset-20260811"
 
 typedef struct {
     int cap_fd;
     uint32_t format;
     uint8_t *cap_buffer[BUFFER_COUNT];
+    size_t cap_buffer_len[BUFFER_COUNT];
 
     int m2m_fd;
     uint8_t *m2m_cap_buffer;
+    size_t m2m_cap_buffer_len;
     uint8_t *pattern_buffer;
     size_t pattern_len;
+    uint32_t frame_count;
+    bool streaming;
+    SemaphoreHandle_t stream_lock;
 
     uvc_fb_t fb;
 } p4_uvc_t;
@@ -91,6 +100,30 @@ static void log_v4l2_pix_format(const char *prefix, const struct v4l2_format *fo
              (char)((pixelformat >> 24) & 0xff),
              (unsigned int)format->fmt.pix.bytesperline,
              (unsigned int)format->fmt.pix.sizeimage);
+}
+
+static void set_capture_frame_rate(int fd, int rate)
+{
+    struct v4l2_streamparm parm = {
+        .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+    };
+
+    parm.parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
+    parm.parm.capture.timeperframe.numerator = 1;
+    parm.parm.capture.timeperframe.denominator = rate;
+
+    if (ioctl(fd, VIDIOC_S_PARM, &parm) != 0) {
+        ESP_LOGW(TAG, "failed to set capture frame rate to %dfps", rate);
+        return;
+    }
+
+    memset(&parm, 0, sizeof(parm));
+    parm.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (ioctl(fd, VIDIOC_G_PARM, &parm) == 0) {
+        ESP_LOGI(TAG, "capture frame rate active: %u/%u sec",
+                 (unsigned int)parm.parm.capture.timeperframe.numerator,
+                 (unsigned int)parm.parm.capture.timeperframe.denominator);
+    }
 }
 
 #if CONFIG_P4SCAN_UVC_TEST_PATTERN
@@ -262,7 +295,6 @@ static esp_err_t init_codec_video(p4_uvc_t *uvc)
 static esp_err_t video_start_cb(uvc_format_t uvc_format, int width, int height, int rate, void *cb_ctx)
 {
     (void)uvc_format;
-    (void)rate;
 
     struct v4l2_buffer buf;
     struct v4l2_format format;
@@ -271,6 +303,8 @@ static esp_err_t video_start_cb(uvc_format_t uvc_format, int width, int height, 
     uint32_t capture_fmt = 0;
 
     ESP_LOGI(TAG, "UVC stream start: %dx%d@%dfps", width, height, rate);
+    xSemaphoreTake(uvc->stream_lock, portMAX_DELAY);
+    uvc->frame_count = 0;
 
 #if CONFIG_P4SCAN_UVC_TEST_PATTERN
     capture_fmt = V4L2_PIX_FMT_RGB565;
@@ -313,6 +347,7 @@ static esp_err_t video_start_cb(uvc_format_t uvc_format, int width, int height, 
 
         if (!capture_fmt) {
             ESP_LOGE(TAG, "camera output pixel format is not supported by JPEG encoder");
+            xSemaphoreGive(uvc->stream_lock);
             return ESP_ERR_NOT_SUPPORTED;
         }
     } else {
@@ -326,6 +361,7 @@ static esp_err_t video_start_cb(uvc_format_t uvc_format, int width, int height, 
     format.fmt.pix.pixelformat = capture_fmt;
     ESP_ERROR_CHECK(ioctl(uvc->cap_fd, VIDIOC_S_FMT, &format));
     log_v4l2_pix_format("capture format selected", &format);
+    set_capture_frame_rate(uvc->cap_fd, rate);
 
     memset(&req, 0, sizeof(req));
     req.count = BUFFER_COUNT;
@@ -341,8 +377,9 @@ static esp_err_t video_start_cb(uvc_format_t uvc_format, int width, int height, 
         ESP_ERROR_CHECK(ioctl(uvc->cap_fd, VIDIOC_QUERYBUF, &buf));
 
         uvc->cap_buffer[i] = (uint8_t *)mmap(NULL, buf.length, PROT_READ | PROT_WRITE,
-                                             MAP_SHARED, uvc->cap_fd, buf.m.offset);
+                                              MAP_SHARED, uvc->cap_fd, buf.m.offset);
         assert(uvc->cap_buffer[i]);
+        uvc->cap_buffer_len[i] = buf.length;
 
         ESP_ERROR_CHECK(ioctl(uvc->cap_fd, VIDIOC_QBUF, &buf));
     }
@@ -383,8 +420,9 @@ static esp_err_t video_start_cb(uvc_format_t uvc_format, int width, int height, 
     ESP_ERROR_CHECK(ioctl(uvc->m2m_fd, VIDIOC_QUERYBUF, &buf));
 
     uvc->m2m_cap_buffer = (uint8_t *)mmap(NULL, buf.length, PROT_READ | PROT_WRITE,
-                                          MAP_SHARED, uvc->m2m_fd, buf.m.offset);
+                                           MAP_SHARED, uvc->m2m_fd, buf.m.offset);
     assert(uvc->m2m_cap_buffer);
+    uvc->m2m_cap_buffer_len = buf.length;
 
     ESP_ERROR_CHECK(ioctl(uvc->m2m_fd, VIDIOC_QBUF, &buf));
 
@@ -397,34 +435,81 @@ static esp_err_t video_start_cb(uvc_format_t uvc_format, int width, int height, 
     ESP_ERROR_CHECK(ioctl(uvc->cap_fd, VIDIOC_STREAMON, &type));
 #endif
 
+    uvc->streaming = true;
+    xSemaphoreGive(uvc->stream_lock);
     return ESP_OK;
 }
 
 static void video_stop_cb(void *cb_ctx)
 {
     p4_uvc_t *uvc = (p4_uvc_t *)cb_ctx;
+    struct v4l2_requestbuffers req;
 
     ESP_LOGI(TAG, "UVC stream stop");
+    xSemaphoreTake(uvc->stream_lock, portMAX_DELAY);
+    if (!uvc->streaming) {
+        xSemaphoreGive(uvc->stream_lock);
+        ESP_LOGI(TAG, "UVC stream already stopped");
+        return;
+    }
+    uvc->streaming = false;
 
     int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 #if !CONFIG_P4SCAN_UVC_TEST_PATTERN
     ioctl(uvc->cap_fd, VIDIOC_STREAMOFF, &type);
+
+    for (int i = 0; i < BUFFER_COUNT; i++) {
+        if (uvc->cap_buffer[i]) {
+            munmap(uvc->cap_buffer[i], uvc->cap_buffer_len[i]);
+            uvc->cap_buffer[i] = NULL;
+            uvc->cap_buffer_len[i] = 0;
+        }
+    }
+
+    memset(&req, 0, sizeof(req));
+    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.memory = V4L2_MEMORY_MMAP;
+    ioctl(uvc->cap_fd, VIDIOC_REQBUFS, &req);
 #endif
 
     type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
     ioctl(uvc->m2m_fd, VIDIOC_STREAMOFF, &type);
     type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     ioctl(uvc->m2m_fd, VIDIOC_STREAMOFF, &type);
+
+    if (uvc->m2m_cap_buffer) {
+        munmap(uvc->m2m_cap_buffer, uvc->m2m_cap_buffer_len);
+        uvc->m2m_cap_buffer = NULL;
+        uvc->m2m_cap_buffer_len = 0;
+    }
+
+    memset(&req, 0, sizeof(req));
+    req.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+    req.memory = V4L2_MEMORY_USERPTR;
+    ioctl(uvc->m2m_fd, VIDIOC_REQBUFS, &req);
+
+    memset(&req, 0, sizeof(req));
+    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.memory = V4L2_MEMORY_MMAP;
+    ioctl(uvc->m2m_fd, VIDIOC_REQBUFS, &req);
+
+    xSemaphoreGive(uvc->stream_lock);
+    vTaskDelay(pdMS_TO_TICKS(50));
 }
 
 static uvc_fb_t *video_fb_get_cb(void *cb_ctx)
 {
     p4_uvc_t *uvc = (p4_uvc_t *)cb_ctx;
-    static uint32_t frame_count;
     struct v4l2_format format;
     struct v4l2_buffer cap_buf;
     struct v4l2_buffer m2m_out_buf;
     struct v4l2_buffer m2m_cap_buf;
+
+    xSemaphoreTake(uvc->stream_lock, portMAX_DELAY);
+    if (!uvc->streaming) {
+        xSemaphoreGive(uvc->stream_lock);
+        return NULL;
+    }
 
 #if !CONFIG_P4SCAN_UVC_TEST_PATTERN
     memset(&cap_buf, 0, sizeof(cap_buf));
@@ -432,7 +517,7 @@ static uvc_fb_t *video_fb_get_cb(void *cb_ctx)
     cap_buf.memory = V4L2_MEMORY_MMAP;
     ESP_ERROR_CHECK(ioctl(uvc->cap_fd, VIDIOC_DQBUF, &cap_buf));
     ESP_ERROR_CHECK(esp_cache_msync(uvc->cap_buffer[cap_buf.index], cap_buf.bytesused, ESP_CACHE_MSYNC_FLAG_DIR_M2C));
-    if (frame_count < 8) {
+    if (uvc->frame_count < 8) {
         ESP_LOGI(TAG, "camera frame: index=%u bytesused=%u",
                  (unsigned int)cap_buf.index,
                  (unsigned int)cap_buf.bytesused);
@@ -478,8 +563,8 @@ static uvc_fb_t *video_fb_get_cb(void *cb_ctx)
     uvc->fb.timestamp.tv_sec = us / 1000000UL;
     uvc->fb.timestamp.tv_usec = us % 1000000UL;
 
-    frame_count++;
-    if ((frame_count % 1) == 0) {
+    uvc->frame_count++;
+    if ((uvc->frame_count % 1) == 0) {
         ESP_LOGI(TAG, "UVC frame ready: %ux%u %s, %u bytes, head=%02x%02x tail=%02x%02x",
                  uvc->fb.width,
                  uvc->fb.height,
@@ -500,11 +585,14 @@ static void video_fb_return_cb(uvc_fb_t *fb, void *cb_ctx)
     p4_uvc_t *uvc = (p4_uvc_t *)cb_ctx;
     struct v4l2_buffer m2m_cap_buf;
 
-    memset(&m2m_cap_buf, 0, sizeof(m2m_cap_buf));
-    m2m_cap_buf.index = 0;
-    m2m_cap_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    m2m_cap_buf.memory = V4L2_MEMORY_MMAP;
-    ESP_ERROR_CHECK(ioctl(uvc->m2m_fd, VIDIOC_QBUF, &m2m_cap_buf));
+    if (uvc->streaming && uvc->m2m_cap_buffer) {
+        memset(&m2m_cap_buf, 0, sizeof(m2m_cap_buf));
+        m2m_cap_buf.index = 0;
+        m2m_cap_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        m2m_cap_buf.memory = V4L2_MEMORY_MMAP;
+        ESP_ERROR_CHECK(ioctl(uvc->m2m_fd, VIDIOC_QBUF, &m2m_cap_buf));
+    }
+    xSemaphoreGive(uvc->stream_lock);
 }
 
 static esp_err_t init_uvc(p4_uvc_t *uvc)
@@ -538,6 +626,8 @@ void app_main(void)
 
     p4_uvc_t *uvc = calloc(1, sizeof(p4_uvc_t));
     assert(uvc);
+    uvc->stream_lock = xSemaphoreCreateMutex();
+    assert(uvc->stream_lock);
 
     ESP_ERROR_CHECK(example_video_init());
 #if CONFIG_P4SCAN_UVC_TEST_PATTERN
