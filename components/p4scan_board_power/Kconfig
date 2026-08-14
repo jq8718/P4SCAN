@@ -1,0 +1,15 @@
+menu "P4SCAN Board Power"
+
+    config P4SCAN_OV01C1B_POWER_ENABLE
+        bool "Power OV01C1B through PCA9538A"
+        default y
+        help
+            Initialize PCA9538A on the shared I2C bus and run the OV01C1B
+            power-up sequence before esp_video probes the camera sensor.
+
+    config P4SCAN_PCA9538A_I2C_ADDR
+        hex "PCA9538A I2C address"
+        default 0x70
+        depends on P4SCAN_OV01C1B_POWER_ENABLE
+
+endmenu

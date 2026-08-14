@@ -9,6 +9,7 @@
 #include "esp_check.h"
 #include "example_video_common.h"
 #include "esp_cam_sensor_xclk.h"
+#include "p4scan_board_power.h"
 
 #if EXAMPLE_ENABLE_MIPI_CSI_CAM_SENSOR
 static const esp_video_init_csi_config_t s_csi_config = {
@@ -236,6 +237,7 @@ esp_err_t example_video_init(void)
 
 #if CONFIG_EXAMPLE_SCCB_I2C_INIT_BY_APP
     ESP_RETURN_ON_ERROR(i2c_new_master_bus(&s_bus_config, &s_i2cbus_handle), TAG, "failed to initialize i2c bus");
+    ESP_RETURN_ON_ERROR(p4scan_ov01c1b_power_on(s_i2cbus_handle), TAG, "failed to power on OV01C1B");
 
 #if EXAMPLE_ENABLE_MIPI_CSI_CAM_SENSOR
     esp_video_init_csi_config_t csi_config = s_csi_config;
@@ -345,6 +347,7 @@ failed_1:
 failed_0:
 #endif
 #if CONFIG_EXAMPLE_SCCB_I2C_INIT_BY_APP
+    ESP_ERROR_CHECK_WITHOUT_ABORT(p4scan_ov01c1b_power_off(s_i2cbus_handle));
     i2c_del_master_bus(s_i2cbus_handle);
     s_i2cbus_handle = NULL;
 #endif
@@ -373,6 +376,7 @@ esp_err_t example_video_deinit(void)
 #endif
 
 #if CONFIG_EXAMPLE_SCCB_I2C_INIT_BY_APP
+    ESP_RETURN_ON_ERROR(p4scan_ov01c1b_power_off(s_i2cbus_handle), TAG, "failed to power off OV01C1B");
     ESP_RETURN_ON_ERROR(i2c_del_master_bus(s_i2cbus_handle), TAG, "failed to delete i2c bus");
     s_i2cbus_handle = NULL;
 #endif

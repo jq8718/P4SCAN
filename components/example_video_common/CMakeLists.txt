@@ -21,7 +21,7 @@ endif()
 
 idf_component_register(SRCS "${srcs}"
                        INCLUDE_DIRS "${inc_dirs}"
-                       REQUIRES "esp_video" "fatfs")
+                       REQUIRES "esp_video" "fatfs" "p4scan_board_power")
 
 if(CONFIG_EXAMPLE_SELECT_JPEG_HW_DRIVER)
     idf_component_optional_requires(PRIVATE "esp_driver_jpeg")

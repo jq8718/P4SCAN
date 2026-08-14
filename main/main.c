@@ -41,7 +41,7 @@
 #endif
 
 #define BUFFER_COUNT        2
-#define P4SCAN_FW_MARK      "raw10-640x480-uvc-abortreset-20260811"
+#define P4SCAN_FW_MARK      "ov01c1b-reopen-stream-20260814"
 
 typedef struct {
     int cap_fd;
@@ -228,7 +228,10 @@ static esp_err_t init_capture_video(p4_uvc_t *uvc)
     struct v4l2_capability capability;
 
     int fd = open(EXAMPLE_CAM_DEV_PATH, O_RDONLY);
-    assert(fd >= 0);
+    if (fd < 0) {
+        ESP_LOGE(TAG, "failed to open capture video device %s, errno=%d", EXAMPLE_CAM_DEV_PATH, errno);
+        return ESP_FAIL;
+    }
 
     ESP_ERROR_CHECK(ioctl(fd, VIDIOC_QUERYCAP, &capability));
     print_video_device_info(&capability);
@@ -244,7 +247,10 @@ static esp_err_t init_codec_video(p4_uvc_t *uvc)
     struct v4l2_ext_control control[1];
 
     int fd = open(ENCODE_DEV_PATH, O_RDONLY);
-    assert(fd >= 0);
+    if (fd < 0) {
+        ESP_LOGE(TAG, "failed to open encoder video device %s, errno=%d", ENCODE_DEV_PATH, errno);
+        return ESP_FAIL;
+    }
 
     ESP_ERROR_CHECK(ioctl(fd, VIDIOC_QUERYCAP, &capability));
     print_video_device_info(&capability);
@@ -622,7 +628,9 @@ static esp_err_t init_uvc(p4_uvc_t *uvc)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "ESP32-P4 SC2336 USB camera starting, fw=%s", P4SCAN_FW_MARK);
+    esp_err_t ret;
+
+    ESP_LOGI(TAG, "ESP32-P4 OV01C1B USB camera starting, fw=%s", P4SCAN_FW_MARK);
 
     p4_uvc_t *uvc = calloc(1, sizeof(p4_uvc_t));
     assert(uvc);
@@ -633,7 +641,21 @@ void app_main(void)
 #if CONFIG_P4SCAN_UVC_TEST_PATTERN
     ESP_LOGW(TAG, "UVC test pattern mode enabled; camera frames are not used");
 #endif
-    ESP_ERROR_CHECK(init_capture_video(uvc));
-    ESP_ERROR_CHECK(init_codec_video(uvc));
-    ESP_ERROR_CHECK(init_uvc(uvc));
+    ret = init_capture_video(uvc);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "capture video init failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ret = init_codec_video(uvc);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "codec video init failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ret = init_uvc(uvc);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "UVC init failed: %s", esp_err_to_name(ret));
+        return;
+    }
 }
