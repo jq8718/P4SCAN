@@ -9,6 +9,7 @@
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 #include "esp_timer.h"
+#include "esp_cache.h"
 #include "esp_check.h"
 #if CONFIG_TINYUSB_RHPORT_HS
 #include "soc/hp_sys_clkrst_reg.h"
@@ -132,6 +133,7 @@ static void video_task(void *arg)
     uint32_t already_start = 0;
     uint32_t tx_busy = 0;
     uint32_t tx_start_ms = 0;
+    uint32_t state_log_count = 0;
     uint8_t *uvc_buffer = s_uvc_device.user_config[0].uvc_buffer;
     uint32_t uvc_buffer_size = s_uvc_device.user_config[0].uvc_buffer_size;
     uvc_fb_t *pic = NULL;
@@ -144,6 +146,11 @@ static void video_task(void *arg)
         }
 
         if (!s_uvc_device.streaming[0] || !tud_video_n_streaming(0, 0)) {
+            if (state_log_count < 8) {
+                ESP_LOGI(TAG, "UVC1 task idle: app_streaming=%d tinyusb_streaming=%d frame=%" PRIu32,
+                         s_uvc_device.streaming[0], tud_video_n_streaming(0, 0), frame_num);
+                state_log_count++;
+            }
             already_start = 0;
             frame_num = 0;
             tx_busy = 0;
@@ -167,8 +174,7 @@ static void video_task(void *arg)
         }
 
         if (tx_busy) {
-            uint32_t xfer_done = ulTaskNotifyTake(pdTRUE, 1);
-            if (xfer_done == 0) {
+            if (tud_video_n_frame_xfer_busy(0, 0)) {
                 if (tx_start_ms && cur - tx_start_ms > UVC_XFER_TIMEOUT_MS) {
                     ESP_LOGW(TAG, "frame %" PRIu32 " transfer timeout, reset UVC1 stream endpoint", frame_num);
                     tud_video_n_stream_reset(0, 0);
@@ -179,16 +185,16 @@ static void video_task(void *arg)
                 }
                 continue;
             }
-            if (tud_video_n_frame_xfer_busy(0, 0)) {
-                ESP_LOGW(TAG, "ignore stale UVC1 transfer notification");
-                continue;
-            }
             ++frame_num;
             tx_busy = 0;
             tx_start_ms = 0;
+            ESP_LOGI(TAG, "UVC1 transfer idle, requesting next frame=%" PRIu32, frame_num);
         }
 
         start_ms += s_uvc_device.interval_ms[0];
+        if (frame_num < 4) {
+            ESP_LOGI(TAG, "UVC1 requesting frame=%" PRIu32, frame_num);
+        }
         ESP_LOGD(TAG, "frame %" PRIu32 " taking picture...", frame_num);
         pic = s_uvc_device.user_config[0].fb_get_cb(s_uvc_device.user_config[0].cb_ctx);
         if (pic) {
@@ -205,8 +211,21 @@ static void video_task(void *arg)
         }
         frame_len = pic->len;
         memcpy(uvc_buffer, pic->buf, frame_len);
+        ESP_ERROR_CHECK(esp_cache_msync(uvc_buffer, frame_len,
+                                        ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED));
         s_uvc_device.user_config[0].fb_return_cb(pic, s_uvc_device.user_config[0].cb_ctx);
-        if (tud_video_n_frame_xfer(0, 0, (void *)uvc_buffer, frame_len)) {
+        bool transfer_started = tud_video_n_frame_xfer(0, 0, (void *)uvc_buffer, frame_len);
+        if (frame_num < 4) {
+            ESP_LOGI(TAG, "UVC1 xfer request: frame=%" PRIu32 " addr=%p len=%" PRIu32
+                     " head=%02x%02x tail=%02x%02x started=%d",
+                     frame_num, uvc_buffer, frame_len,
+                     frame_len >= 2 ? uvc_buffer[0] : 0,
+                     frame_len >= 2 ? uvc_buffer[1] : 0,
+                     frame_len >= 2 ? uvc_buffer[frame_len - 2] : 0,
+                     frame_len >= 2 ? uvc_buffer[frame_len - 1] : 0,
+                     transfer_started);
+        }
+        if (transfer_started) {
             tx_busy = 1;
             tx_start_ms = get_time_millis();
             ESP_LOGD(TAG, "frame %" PRIu32 " transfer start, size %" PRIu32, frame_num, frame_len);
@@ -265,8 +284,7 @@ static void video_task2(void *arg)
         }
 
         if (tx_busy) {
-            uint32_t xfer_done = ulTaskNotifyTake(pdTRUE, 1);
-            if (xfer_done == 0) {
+            if (tud_video_n_frame_xfer_busy(1, 0)) {
                 if (tx_start_ms && cur - tx_start_ms > UVC_XFER_TIMEOUT_MS) {
                     ESP_LOGW(TAG, "frame %" PRIu32 " transfer timeout, reset UVC2 stream endpoint", frame_num);
                     tud_video_n_stream_reset(1, 0);
@@ -275,10 +293,6 @@ static void video_task2(void *arg)
                     tx_start_ms = 0;
                     start_ms = get_time_millis();
                 }
-                continue;
-            }
-            if (tud_video_n_frame_xfer_busy(1, 0)) {
-                ESP_LOGW(TAG, "ignore stale UVC2 transfer notification");
                 continue;
             }
             ++frame_num;
@@ -324,6 +338,7 @@ void tud_video_frame_xfer_complete_cb(uint_fast8_t ctl_idx, uint_fast8_t stm_idx
 {
     (void)ctl_idx;
     (void)stm_idx;
+    ESP_LOGI(TAG, "UVC%u transfer complete", (unsigned int)ctl_idx + 1);
     xTaskNotifyGive(s_uvc_device.uvc_task_hdl[ctl_idx]);
 }
 

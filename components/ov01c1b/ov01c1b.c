@@ -25,6 +25,16 @@ typedef struct {
 #define delay_ms(ms) vTaskDelay(pdMS_TO_TICKS(ms))
 #define OV01C1B_MCLK (24 * 1000 * 1000)
 
+#if CONFIG_CAMERA_OV01C1B_COLORBAR_FULL_1032X1032
+#define OV01C1B_FORMAT_WIDTH  1032
+#define OV01C1B_FORMAT_HEIGHT 1032
+#define OV01C1B_FORMAT_NAME   "MIPI_1lane_24Minput_RAW10_1032x1032_colorbar"
+#else
+#define OV01C1B_FORMAT_WIDTH  1024
+#define OV01C1B_FORMAT_HEIGHT 1024
+#define OV01C1B_FORMAT_NAME   "MIPI_1lane_24Minput_RAW10_1024x1024_50fps"
+#endif
+
 static const char *TAG = "ov01c1b";
 
 static esp_cam_sensor_bayer_pattern_t ov01c1b_get_bayer_pattern(void)
@@ -45,8 +55,8 @@ static const esp_cam_sensor_isp_info_t ov01c1b_isp_info[] = {
         .isp_v1_info = {
             .version = SENSOR_ISP_INFO_VERSION_DEFAULT,
             .pclk = 89000000,
-            .vts = 5000,
-            .hts = 364,
+            .vts = 2500,
+            .hts = 1024,
             .tline_ns = 4090,
             .bayer_type = ESP_CAM_SENSOR_BAYER_BGGR,
         },
@@ -56,12 +66,12 @@ static const esp_cam_sensor_isp_info_t ov01c1b_isp_info[] = {
 static const esp_cam_sensor_format_t ov01c1b_format_info[] = {
 #if CONFIG_CAMERA_OV01C1B_MIPI_RAW10_1024X1024_50FPS
     {
-        .name = "MIPI_1lane_24Minput_RAW10_1024x1024_50fps",
+        .name = OV01C1B_FORMAT_NAME,
         .format = ESP_CAM_SENSOR_PIXFORMAT_RAW10,
         .port = ESP_CAM_SENSOR_MIPI_CSI,
         .xclk = OV01C1B_MCLK,
-        .width = 1024,
-        .height = 1024,
+        .width = OV01C1B_FORMAT_WIDTH,
+        .height = OV01C1B_FORMAT_HEIGHT,
         .regs = ov01c1b_mipi_1lane_24Minput_1024x1024_raw10_50fps,
         .regs_size = ARRAY_SIZE(ov01c1b_mipi_1lane_24Minput_1024x1024_raw10_50fps),
         .fps = 50,
@@ -109,6 +119,108 @@ static esp_err_t ov01c1b_write_array(esp_sccb_io_handle_t sccb_handle, const ov0
     return ESP_OK;
 }
 
+static void ov01c1b_log_p1_debug_registers(esp_cam_sensor_device_t *dev, const char *stage)
+{
+    static const uint8_t registers[] = {0xbc, 0xbd, 0x35, 0x36, 0x05, 0x06};
+    uint8_t values[sizeof(registers)] = {0};
+    bool read_ok = true;
+
+    if (ov01c1b_write(dev->sccb_handle, OV01C1B_REG_PAGE_SEL, 0x01) != ESP_OK) {
+        ESP_LOGW(TAG, "%s: failed to select page 1", stage);
+        return;
+    }
+
+    for (size_t i = 0; i < sizeof(registers); i++) {
+        if (ov01c1b_read(dev->sccb_handle, registers[i], &values[i]) != ESP_OK) {
+            ESP_LOGW(TAG, "%s: failed to read P1:0x%02x", stage, registers[i]);
+            read_ok = false;
+        }
+    }
+
+    if (ov01c1b_write(dev->sccb_handle, OV01C1B_REG_PAGE_SEL, 0x00) != ESP_OK) {
+        ESP_LOGW(TAG, "%s: failed to restore page 0", stage);
+        return;
+    }
+
+    if (read_ok) {
+        ESP_LOGI(TAG, "%s: P1:BC=0x%02x BD=0x%02x 35=0x%02x 36=0x%02x 05=0x%02x 06=0x%02x",
+                 stage, values[0], values[1], values[2], values[3], values[4], values[5]);
+    }
+}
+
+static void ov01c1b_log_mode_registers(esp_cam_sensor_device_t *dev)
+{
+    uint8_t value[5] = {0};
+
+    if (ov01c1b_write(dev->sccb_handle, OV01C1B_REG_PAGE_SEL, 0x00) != ESP_OK) {
+        return;
+    }
+    for (uint8_t i = 0; i < 5; i++) {
+        if (ov01c1b_read(dev->sccb_handle, (uint8_t)(0x8e + i), &value[i]) != ESP_OK) {
+            return;
+        }
+    }
+    ESP_LOGI(TAG, "mode P0:8e=0x%02x 8f=0x%02x 90=0x%02x 91=0x%02x 92=0x%02x",
+             value[0], value[1], value[2], value[3], value[4]);
+
+    if (ov01c1b_write(dev->sccb_handle, OV01C1B_REG_PAGE_SEL, 0x01) != ESP_OK) {
+        return;
+    }
+    for (uint8_t i = 0; i < 5; i++) {
+        if (ov01c1b_read(dev->sccb_handle, (uint8_t)(0x02 + i), &value[i]) != ESP_OK) {
+            return;
+        }
+    }
+    ESP_LOGI(TAG, "mode P1:02=0x%02x 03=0x%02x 04=0x%02x 05=0x%02x 06=0x%02x",
+             value[0], value[1], value[2], value[3], value[4]);
+    ov01c1b_log_p1_debug_registers(dev, "after-init");
+
+    if (ov01c1b_write(dev->sccb_handle, OV01C1B_REG_PAGE_SEL, 0x00) != ESP_OK) {
+        return;
+    }
+    if (ov01c1b_read(dev->sccb_handle, 0x97, &value[0]) == ESP_OK) {
+        ESP_LOGI(TAG, "mode P0:97 data_id=0x%02x", value[0]);
+    }
+}
+
+static esp_err_t ov01c1b_set_test_pattern(esp_cam_sensor_device_t *dev, bool enable)
+{
+    uint8_t pattern_enable = 0;
+    uint8_t pattern_output = 0;
+
+    ESP_RETURN_ON_ERROR(ov01c1b_write(dev->sccb_handle, OV01C1B_REG_PAGE_SEL, 0x04), TAG,
+                        "failed to select page 4 for ColorBar");
+    ESP_RETURN_ON_ERROR(ov01c1b_write(dev->sccb_handle, 0xf3, enable ? 0x03 : 0x00), TAG,
+                        "failed to configure P4:F3 ColorBar enable");
+    ESP_RETURN_ON_ERROR(ov01c1b_write(dev->sccb_handle, 0x12, enable ? 0x01 : 0x00), TAG,
+                        "failed to configure P4:12 ColorBar output");
+    ESP_RETURN_ON_ERROR(ov01c1b_read(dev->sccb_handle, 0xf3, &pattern_enable), TAG,
+                        "failed to read P4:F3 ColorBar enable");
+    ESP_RETURN_ON_ERROR(ov01c1b_read(dev->sccb_handle, 0x12, &pattern_output), TAG,
+                        "failed to read P4:12 ColorBar output");
+    ESP_LOGW(TAG, "internal ColorBar %s: P4:F3=0x%02x P4:12=0x%02x; FSIN registers unchanged",
+             enable ? "enabled" : "disabled", pattern_enable, pattern_output);
+    ESP_RETURN_ON_ERROR(ov01c1b_write(dev->sccb_handle, OV01C1B_REG_PAGE_SEL, 0x00), TAG,
+                        "failed to restore page 0 after test pattern");
+    return ESP_OK;
+}
+
+static esp_err_t ov01c1b_set_colorbar_mipi_size(esp_cam_sensor_device_t *dev)
+{
+    ESP_RETURN_ON_ERROR(ov01c1b_write(dev->sccb_handle, OV01C1B_REG_PAGE_SEL, 0x00), TAG,
+                        "failed to select page 0 for ColorBar MIPI size");
+    ESP_RETURN_ON_ERROR(ov01c1b_write(dev->sccb_handle, 0x8e, 0x04), TAG,
+                        "failed to set ColorBar MIPI width MSB");
+    ESP_RETURN_ON_ERROR(ov01c1b_write(dev->sccb_handle, 0x8f, 0x08), TAG,
+                        "failed to set ColorBar MIPI width LSB");
+    ESP_RETURN_ON_ERROR(ov01c1b_write(dev->sccb_handle, 0x90, 0x04), TAG,
+                        "failed to set ColorBar MIPI height MSB");
+    ESP_RETURN_ON_ERROR(ov01c1b_write(dev->sccb_handle, 0x91, 0x08), TAG,
+                        "failed to set ColorBar MIPI height LSB");
+    ESP_LOGW(TAG, "ColorBar MIPI size override: P0:8e/8f=0x0408, P0:90/91=0x0408");
+    return ESP_OK;
+}
+
 static esp_err_t ov01c1b_get_sensor_id(esp_cam_sensor_device_t *dev, esp_cam_sensor_id_t *id)
 {
     uint8_t chip_id[4] = {0};
@@ -148,6 +260,18 @@ static esp_err_t ov01c1b_set_stream(esp_cam_sensor_device_t *dev, int enable)
         return ESP_OK;
     }
 #endif
+
+    if (enable) {
+#if CONFIG_CAMERA_OV01C1B_TEST_PATTERN
+        /* The vendor sequence enables the pattern before MIPI output. */
+        ESP_RETURN_ON_ERROR(ov01c1b_set_test_pattern(dev, true), TAG,
+                            "failed to enable internal test pattern before stream on");
+#if CONFIG_CAMERA_OV01C1B_COLORBAR_FULL_1032X1032
+        ESP_RETURN_ON_ERROR(ov01c1b_set_colorbar_mipi_size(dev), TAG,
+                            "failed to set ColorBar MIPI frame size");
+#endif
+#endif
+    }
 
     ESP_RETURN_ON_ERROR(ov01c1b_write(dev->sccb_handle, OV01C1B_REG_PAGE_SEL, 0x00), TAG,
                         "failed to select page 0 for stream %s", enable ? "on" : "off");
@@ -280,6 +404,7 @@ static esp_err_t ov01c1b_set_format(esp_cam_sensor_device_t *dev, const esp_cam_
     if (ret != ESP_OK) {
         return ESP_CAM_SENSOR_ERR_FAILED_SET_FORMAT;
     }
+    ov01c1b_log_mode_registers(dev);
 
     ret = ov01c1b_set_stream(dev, 0);
     if (ret != ESP_OK) {
@@ -405,6 +530,7 @@ esp_cam_sensor_device_t *ov01c1b_detect(esp_cam_sensor_config_t *config)
         goto failed;
     }
 
+    ov01c1b_log_p1_debug_registers(dev, "power-up");
     ESP_LOGI(TAG, "Detected OV01C1B-compatible sensor, probe PID=0x%04x", dev->id.pid);
     return dev;
 

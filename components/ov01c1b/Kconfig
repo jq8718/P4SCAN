@@ -30,7 +30,7 @@ if CAMERA_OV01C1B
     config CAMERA_OV01C1B_MIPI_CLK_MHZ
         int "MIPI lane bit rate in MHz"
         range 100 1500
-        default 1434
+        default 1300
         help
             Bring-up default comes from the vendor register file comment
             "phy_clk=1434M". Adjust this after oscilloscope measurement.
@@ -42,6 +42,21 @@ if CAMERA_OV01C1B
             Keep the sensor transmitting MIPI after the CSI video device is
             stopped. This is only for probing the MIPI clock during bring-up;
             it prevents a later CSI reopen from restarting the sensor cleanly.
+
+    config CAMERA_OV01C1B_TEST_PATTERN
+        bool "Enable OV01C1B internal test pattern"
+        default n
+        help
+            Enable the sensor's internal test pattern registers for MIPI/CSI
+            bring-up. The test pattern is monochrome and is not camera output.
+
+    config CAMERA_OV01C1B_COLORBAR_FULL_1032X1032
+        bool "Use 1032x1032 CSI dimensions for ColorBar"
+        depends on CAMERA_OV01C1B_TEST_PATTERN
+        default n
+        help
+            OV01C1B ColorBar output uses the sensor's full 1032x1032 pattern
+            size. Enable this only when the internal ColorBar is enabled.
 
     choice CAMERA_OV01C1B_BAYER_PATTERN
         prompt "Bayer pattern"

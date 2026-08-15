@@ -36,7 +36,19 @@ static esp_err_t pca9538a_add_device(i2c_master_bus_handle_t bus_handle, i2c_mas
 static esp_err_t pca9538a_write(i2c_master_dev_handle_t dev_handle, uint8_t reg, uint8_t value)
 {
     uint8_t data[] = {reg, value};
-    return i2c_master_transmit(dev_handle, data, sizeof(data), pdMS_TO_TICKS(100));
+    esp_err_t ret = ESP_FAIL;
+
+    for (int attempt = 0; attempt < 3; attempt++) {
+        ret = i2c_master_transmit(dev_handle, data, sizeof(data), pdMS_TO_TICKS(100));
+        if (ret == ESP_OK) {
+            return ESP_OK;
+        }
+        ESP_LOGW(TAG, "PCA9538A write reg=0x%02x value=0x%02x failed (%s), retry=%d",
+                 reg, value, esp_err_to_name(ret), attempt + 1);
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+
+    return ret;
 }
 
 static esp_err_t pca9538a_set_output(i2c_master_dev_handle_t dev_handle, uint8_t value)

@@ -47,6 +47,21 @@ PC 端主要承担：
 raw10-640x480-uvc-abortreset-20260811
 ```
 
+OV01C1B 的测试寄存器需要区分两种功能：
+
+- ColorBar 使用 `P4:0xF3=0x03` 和 `P4:0x12=0x01`，图像由传感器内部电路生成，与像素阵列无关。
+- 规格书说明 ColorBar 的完整输出尺寸为 `1032x1032`，不能直接用普通 `1024x1024` CSI 配置验证；RAW10 单帧应为 `1,331,280` 字节。
+- 厂商代码中的 `P1:0xF0=0x04`、`P1:0xF3=0x03`、`P1:0x12=0x01` 属于 FSIN/EVSYNC 帧同步输出路径，不是 ColorBar 配置。
+
+当前 MIPI bring-up 只启用 P4 ColorBar，不写入 P1 FSIN 配置。
+
+RAW10 接收诊断结论（2026-08-15）：
+
+- ESP32-P4 PSRAM 原配置为 `20MHz`，在 OV01C1B `1024x1024@50fps` RAW10 连续输出时会造成 CSI bridge 丢帧；改为 `200MHz` 后，1024x1024 帧可完整接收。
+- 1032x1032 RAW10 帧长度不是 64 字节对齐，CSI 驱动和应用的 `esp_cache_msync` 必须对同步地址/长度向外按 64 字节对齐，否则 UVC 侧只能得到黑色占位帧。
+- 1024x1024 测试帧的逐行比较显示 `1024/1024` 行均有数据，但不是每行都相同；示例为 `same_previous=1020/1023`，应以行转换日志判断测试图案的实际边界。
+- 本次 ColorBar RAW10 复测得到四个水平区域：`y=0..216`、`217..472`、`473..728`、`729..1023`；区域内行完全相同，边界行是 `217/473/729`，且 CSI 状态无 `phy/pkt/boundary/seq/crc` 错误。
+
 当前稳定提交：
 
 ```text
@@ -89,7 +104,7 @@ git@github.com:jq8718/P4SCAN.git
 | Flash | GD25Q128ES1G | 16MB, 128Mbit | `CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y` |
 | Flash 模式 | SPI Flash | DIO, 80MHz | `CONFIG_ESPTOOLPY_FLASHMODE_DIO=y`, `CONFIG_ESPTOOLPY_FLASHFREQ_80M=y` |
 | PSRAM | ESP32-P4NRW32 内置 Octal PSRAM | 4MB, 32Mbit | `CONFIG_SPIRAM=y`, `CONFIG_SPIRAM_MODE_HEX=y` |
-| PSRAM 频率 | Octal PSRAM | 20MHz | `CONFIG_SPIRAM_SPEED_20M=y` |
+| PSRAM 频率 | Octal PSRAM | 200MHz | `CONFIG_SPIRAM_SPEED_200M=y` |
 | 堆分配策略 | PSRAM 优先 | 小于 16KB 优先内部 RAM | `CONFIG_SPIRAM_USE_MALLOC=y`, `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=16384` |
 
 ## 关键硬件连接

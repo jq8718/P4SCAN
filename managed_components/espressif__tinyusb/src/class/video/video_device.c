@@ -1533,8 +1533,6 @@ bool videod_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_
 }
 
 bool videod_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes) {
-  (void)result; (void)xferred_bytes;
-
   /* find streaming handle */
   uint_fast8_t itf;
   videod_interface_t *ctl;
@@ -1553,6 +1551,10 @@ bool videod_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint3
   }
   TU_ASSERT(itf < CFG_TUD_VIDEO_STREAMING);
   videod_streaming_epbuf_t *stm_epbuf = &_videod_streaming_epbuf[itf];
+
+  printf("UVC xfer: itf=%u result=%u bytes=%u offset=%u bufsize=%u\n",
+         (unsigned int)itf, (unsigned int)result, (unsigned int)xferred_bytes,
+         (unsigned int)stm->offset, (unsigned int)stm->bufsize);
 
   if (stm->offset < stm->bufsize) {
     /* Claim the endpoint */

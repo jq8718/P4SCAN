@@ -8,6 +8,13 @@ menu "Example Configuration"
             same hardware JPEG encoder and UVC path. This is useful to isolate
             UVC/JPEG transport issues from camera/ISP capture issues.
 
+    config P4SCAN_CSI_RAW10_BYPASS_ISP
+        bool "Request CSI RAW10 output and bypass ISP"
+        default n
+        help
+            Request the sensor RAW10 format directly from the CSI device.
+            This is intended for sensor and CSI bring-up diagnostics.
+
     if FORMAT_MJPEG_CAM1
         config EXAMPLE_JPEG_COMPRESSION_QUALITY
             int "JPEG compression quality (%)"
