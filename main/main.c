@@ -726,8 +726,8 @@ static esp_err_t video_start_cb_internal(uvc_format_t uvc_format, int width, int
     ESP_LOGI(TAG, "ISP path test: CSI RAW10 -> ISP RGB565 -> JPEG");
 #else
     capture_fmt = V4L2_PIX_FMT_SBGGR10;
-    encoder_input_fmt = V4L2_PIX_FMT_GREY;
-    ESP_LOGI(TAG, "mono path: CSI RAW10 -> RAW10 unpack -> GREY -> JPEG");
+    encoder_input_fmt = V4L2_PIX_FMT_RGB565;
+    ESP_LOGI(TAG, "mono path: CSI RAW10 -> RAW10 unpack -> grayscale RGB565 -> JPEG");
 #endif
 
     memset(&format, 0, sizeof(format));
@@ -1017,17 +1017,12 @@ static uvc_fb_t *video_fb_get_cb(void *cb_ctx)
             log_raw8_diagnostics(uvc->raw8_buffer, uvc->raw8_buffer_len,
                                  uvc->capture_width, uvc->capture_height);
         }
-        ESP_ERROR_CHECK(esp_cache_msync(uvc->raw8_buffer, uvc->raw8_buffer_len,
+        convert_raw8_to_rgb565(uvc->raw8_buffer, uvc->raw565_buffer,
+                               uvc->capture_width, uvc->capture_height);
+        ESP_ERROR_CHECK(esp_cache_msync(uvc->raw565_buffer, uvc->raw565_buffer_len,
                                          ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED));
-#if P4SCAN_RAW8_SYNTHETIC_TEST
-        ESP_ERROR_CHECK(esp_cache_msync(uvc->pattern_buffer, uvc->pattern_len,
-                                        ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED));
-        m2m_out_buf.m.userptr = (unsigned long)uvc->pattern_buffer;
-        m2m_out_buf.length = uvc->pattern_len;
-#else
-        m2m_out_buf.m.userptr = (unsigned long)uvc->raw8_buffer;
-        m2m_out_buf.length = uvc->raw8_buffer_len;
-#endif
+        m2m_out_buf.m.userptr = (unsigned long)uvc->raw565_buffer;
+        m2m_out_buf.length = uvc->raw565_buffer_len;
     } else if (uvc->capture_format == V4L2_PIX_FMT_SBGGR8) {
         if (uvc->frame_count < 2) {
             log_raw8_diagnostics(uvc->cap_buffer[cap_buf.index], cap_buf.bytesused,
