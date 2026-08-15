@@ -47,10 +47,11 @@
 #define P4SCAN_FW_MARK      "ov01c1b-raw10-synthetic-input-20260815"
 #define P4SCAN_CACHE_LINE   64
 #define P4SCAN_VERBOSE_RAW_DIAGNOSTICS 1
-#define P4SCAN_RAW8_SYNTHETIC_TEST 1
+#define P4SCAN_RAW8_SYNTHETIC_TEST 0
 #define P4SCAN_STOP_CSI_BEFORE_JPEG 0
 #define P4SCAN_USE_ISP_RGB565_TEST 0
 #define P4SCAN_LOG_BUFFER_LAYOUT 1
+#define P4SCAN_AUTO_CSI_TEST 0
 
 typedef struct {
     int cap_fd;
@@ -77,6 +78,7 @@ typedef struct {
     size_t pattern_len;
     uint32_t frame_count;
     bool streaming;
+    bool csi_only;
     SemaphoreHandle_t stream_lock;
 
     uvc_fb_t fb;
@@ -642,7 +644,10 @@ static esp_err_t init_codec_video(p4_uvc_t *uvc)
     return ESP_OK;
 }
 
-static esp_err_t video_start_cb(uvc_format_t uvc_format, int width, int height, int rate, void *cb_ctx)
+static void video_stop_cb(void *cb_ctx);
+
+static esp_err_t video_start_cb_internal(uvc_format_t uvc_format, int width, int height, int rate,
+                                         void *cb_ctx, bool csi_only)
 {
     (void)uvc_format;
 
@@ -655,9 +660,16 @@ static esp_err_t video_start_cb(uvc_format_t uvc_format, int width, int height, 
 
     ESP_LOGI(TAG, "UVC stream start: %dx%d@%dfps", width, height, rate);
     xSemaphoreTake(uvc->stream_lock, portMAX_DELAY);
+    if (uvc->streaming) {
+        ESP_LOGW(TAG, "UVC stream already active; stopping it before reconfiguration");
+        xSemaphoreGive(uvc->stream_lock);
+        video_stop_cb(uvc);
+        xSemaphoreTake(uvc->stream_lock, portMAX_DELAY);
+    }
     uvc->frame_count = 0;
     uvc->raw_compare_valid = false;
     uvc->capture_stream_stopped = false;
+    uvc->csi_only = csi_only;
 
 #if CONFIG_P4SCAN_UVC_TEST_PATTERN
     capture_fmt = V4L2_PIX_FMT_GREY;
@@ -783,53 +795,57 @@ static esp_err_t video_start_cb(uvc_format_t uvc_format, int width, int height, 
     }
 #endif
 
-    memset(&format, 0, sizeof(format));
-    format.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-    format.fmt.pix.width = width;
-    format.fmt.pix.height = height;
-    format.fmt.pix.pixelformat = encoder_input_fmt;
-    ESP_ERROR_CHECK(ioctl(uvc->m2m_fd, VIDIOC_S_FMT, &format));
-    log_v4l2_pix_format("encoder input format selected", &format);
+    if (!csi_only) {
+        memset(&format, 0, sizeof(format));
+        format.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+        format.fmt.pix.width = width;
+        format.fmt.pix.height = height;
+        format.fmt.pix.pixelformat = encoder_input_fmt;
+        ESP_ERROR_CHECK(ioctl(uvc->m2m_fd, VIDIOC_S_FMT, &format));
+        log_v4l2_pix_format("encoder input format selected", &format);
 
-    memset(&req, 0, sizeof(req));
-    req.count = 1;
-    req.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-    req.memory = V4L2_MEMORY_USERPTR;
-    ESP_ERROR_CHECK(ioctl(uvc->m2m_fd, VIDIOC_REQBUFS, &req));
+        memset(&req, 0, sizeof(req));
+        req.count = 1;
+        req.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+        req.memory = V4L2_MEMORY_USERPTR;
+        ESP_ERROR_CHECK(ioctl(uvc->m2m_fd, VIDIOC_REQBUFS, &req));
 
-    memset(&format, 0, sizeof(format));
-    format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    format.fmt.pix.width = width;
-    format.fmt.pix.height = height;
-    format.fmt.pix.pixelformat = uvc->format;
-    ESP_ERROR_CHECK(ioctl(uvc->m2m_fd, VIDIOC_S_FMT, &format));
-    log_v4l2_pix_format("encoder output format selected", &format);
+        memset(&format, 0, sizeof(format));
+        format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        format.fmt.pix.width = width;
+        format.fmt.pix.height = height;
+        format.fmt.pix.pixelformat = uvc->format;
+        ESP_ERROR_CHECK(ioctl(uvc->m2m_fd, VIDIOC_S_FMT, &format));
+        log_v4l2_pix_format("encoder output format selected", &format);
 
-    memset(&req, 0, sizeof(req));
-    req.count = 1;
-    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    req.memory = V4L2_MEMORY_MMAP;
-    ESP_ERROR_CHECK(ioctl(uvc->m2m_fd, VIDIOC_REQBUFS, &req));
+        memset(&req, 0, sizeof(req));
+        req.count = 1;
+        req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        req.memory = V4L2_MEMORY_MMAP;
+        ESP_ERROR_CHECK(ioctl(uvc->m2m_fd, VIDIOC_REQBUFS, &req));
 
-    memset(&buf, 0, sizeof(buf));
-    buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    buf.memory = V4L2_MEMORY_MMAP;
-    buf.index = 0;
-    ESP_ERROR_CHECK(ioctl(uvc->m2m_fd, VIDIOC_QUERYBUF, &buf));
+        memset(&buf, 0, sizeof(buf));
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = 0;
+        ESP_ERROR_CHECK(ioctl(uvc->m2m_fd, VIDIOC_QUERYBUF, &buf));
 
-    uvc->m2m_cap_buffer = (uint8_t *)mmap(NULL, buf.length, PROT_READ | PROT_WRITE,
-                                           MAP_SHARED, uvc->m2m_fd, buf.m.offset);
-    assert(uvc->m2m_cap_buffer);
-    uvc->m2m_cap_buffer_len = buf.length;
+        uvc->m2m_cap_buffer = (uint8_t *)mmap(NULL, buf.length, PROT_READ | PROT_WRITE,
+                                               MAP_SHARED, uvc->m2m_fd, buf.m.offset);
+        assert(uvc->m2m_cap_buffer);
+        uvc->m2m_cap_buffer_len = buf.length;
 
-    ESP_ERROR_CHECK(ioctl(uvc->m2m_fd, VIDIOC_QBUF, &buf));
+        ESP_ERROR_CHECK(ioctl(uvc->m2m_fd, VIDIOC_QBUF, &buf));
 
-    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    ESP_ERROR_CHECK(ioctl(uvc->m2m_fd, VIDIOC_STREAMON, &type));
-    type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-    ESP_ERROR_CHECK(ioctl(uvc->m2m_fd, VIDIOC_STREAMON, &type));
+        int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        ESP_ERROR_CHECK(ioctl(uvc->m2m_fd, VIDIOC_STREAMON, &type));
+        type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+        ESP_ERROR_CHECK(ioctl(uvc->m2m_fd, VIDIOC_STREAMON, &type));
+    } else {
+        ESP_LOGI(TAG, "CSI-only test: JPEG encoder path disabled");
+    }
 #if !CONFIG_P4SCAN_UVC_TEST_PATTERN
-    type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     ESP_ERROR_CHECK(ioctl(uvc->cap_fd, VIDIOC_STREAMON, &type));
 #endif
 
@@ -838,6 +854,11 @@ static esp_err_t video_start_cb(uvc_format_t uvc_format, int width, int height, 
     uvc->streaming = true;
     xSemaphoreGive(uvc->stream_lock);
     return ESP_OK;
+}
+
+static esp_err_t video_start_cb(uvc_format_t uvc_format, int width, int height, int rate, void *cb_ctx)
+{
+    return video_start_cb_internal(uvc_format, width, height, rate, cb_ctx, false);
 }
 
 static void video_stop_cb(void *cb_ctx)
@@ -873,10 +894,12 @@ static void video_stop_cb(void *cb_ctx)
 
 #endif
 
-    type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-    ioctl(uvc->m2m_fd, VIDIOC_STREAMOFF, &type);
-    type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    ioctl(uvc->m2m_fd, VIDIOC_STREAMOFF, &type);
+    if (!uvc->csi_only) {
+        type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+        ioctl(uvc->m2m_fd, VIDIOC_STREAMOFF, &type);
+        type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        ioctl(uvc->m2m_fd, VIDIOC_STREAMOFF, &type);
+    }
 
     if (uvc->m2m_cap_buffer) {
         munmap(uvc->m2m_cap_buffer, uvc->m2m_cap_buffer_len);
@@ -901,15 +924,17 @@ static void video_stop_cb(void *cb_ctx)
         uvc->raw565_buffer_len = 0;
     }
 
-    memset(&req, 0, sizeof(req));
-    req.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-    req.memory = V4L2_MEMORY_USERPTR;
-    ioctl(uvc->m2m_fd, VIDIOC_REQBUFS, &req);
+    if (!uvc->csi_only) {
+        memset(&req, 0, sizeof(req));
+        req.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+        req.memory = V4L2_MEMORY_USERPTR;
+        ioctl(uvc->m2m_fd, VIDIOC_REQBUFS, &req);
 
-    memset(&req, 0, sizeof(req));
-    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    req.memory = V4L2_MEMORY_MMAP;
-    ioctl(uvc->m2m_fd, VIDIOC_REQBUFS, &req);
+        memset(&req, 0, sizeof(req));
+        req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        req.memory = V4L2_MEMORY_MMAP;
+        ioctl(uvc->m2m_fd, VIDIOC_REQBUFS, &req);
+    }
 
     xSemaphoreGive(uvc->stream_lock);
     vTaskDelay(pdMS_TO_TICKS(50));
@@ -922,6 +947,7 @@ static uvc_fb_t *video_fb_get_cb(void *cb_ctx)
     struct v4l2_buffer cap_buf;
     struct v4l2_buffer m2m_out_buf;
     struct v4l2_buffer m2m_cap_buf;
+    const uint8_t *capture_frame = NULL;
 
     xSemaphoreTake(uvc->stream_lock, portMAX_DELAY);
     if (!uvc->streaming) {
@@ -944,6 +970,7 @@ static uvc_fb_t *video_fb_get_cb(void *cb_ctx)
     ESP_ERROR_CHECK(cache_msync_aligned(uvc->cap_buffer[cap_buf.index],
                                         uvc->cap_buffer_len[cap_buf.index],
                                         ESP_CACHE_MSYNC_FLAG_DIR_M2C));
+    capture_frame = uvc->cap_buffer[cap_buf.index];
 #if P4SCAN_STOP_CSI_BEFORE_JPEG
     {
         int capture_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -960,8 +987,8 @@ static uvc_fb_t *video_fb_get_cb(void *cb_ctx)
                  (unsigned int)cap_buf.index,
                  (unsigned int)cap_buf.bytesused);
         if (uvc->frame_count < 8 && uvc->capture_format == V4L2_PIX_FMT_SBGGR10) {
-            log_capture_diagnostics(uvc, uvc->cap_buffer[cap_buf.index], cap_buf.bytesused);
-            compare_raw10_frame(uvc, uvc->cap_buffer[cap_buf.index], cap_buf.bytesused);
+            log_capture_diagnostics(uvc, capture_frame, cap_buf.bytesused);
+            compare_raw10_frame(uvc, capture_frame, cap_buf.bytesused);
         }
     }
 #endif
@@ -977,7 +1004,7 @@ static uvc_fb_t *video_fb_get_cb(void *cb_ctx)
     m2m_out_buf.length = uvc->pattern_len;
 #else
     if (uvc->capture_format == V4L2_PIX_FMT_SBGGR10) {
-        unpack_raw10_to_raw8(uvc->cap_buffer[cap_buf.index], uvc->raw8_buffer,
+        unpack_raw10_to_raw8(capture_frame, uvc->raw8_buffer,
                              uvc->capture_width, uvc->capture_height);
 #if P4SCAN_RAW8_SYNTHETIC_TEST
         for (size_t i = 0; i < uvc->raw8_buffer_len; i++) {
@@ -1115,6 +1142,44 @@ static void video_fb_return_cb(uvc_fb_t *fb, void *cb_ctx)
     xSemaphoreGive(uvc->stream_lock);
 }
 
+static esp_err_t run_csi_continuous_test(p4_uvc_t *uvc)
+{
+    esp_err_t ret = video_start_cb_internal(UVC_FORMAT_JPEG, 1024, 1024, 2, uvc, true);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    for (uint32_t frame = 0; frame < 5; frame++) {
+        struct v4l2_buffer cap_buf = {
+            .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+            .memory = V4L2_MEMORY_MMAP,
+        };
+        if (ioctl(uvc->cap_fd, VIDIOC_DQBUF, &cap_buf) != 0) {
+            ret = ESP_FAIL;
+            ESP_LOGE(TAG, "continuous-frame test: frame=%u DQBUF failed",
+                     (unsigned int)frame);
+            log_csi_bridge_diagnostics();
+            break;
+        }
+
+        ESP_ERROR_CHECK(cache_msync_aligned(uvc->cap_buffer[cap_buf.index],
+                                            uvc->cap_buffer_len[cap_buf.index],
+                                            ESP_CACHE_MSYNC_FLAG_DIR_M2C));
+        uint32_t crc = esp_rom_crc32_le(0, uvc->cap_buffer[cap_buf.index], cap_buf.bytesused);
+        ESP_LOGI(TAG, "continuous-frame test: frame=%u index=%u bytesused=%u crc=%08x flags=0x%08x",
+                 (unsigned int)frame, (unsigned int)cap_buf.index,
+                 (unsigned int)cap_buf.bytesused, (unsigned int)crc,
+                 (unsigned int)cap_buf.flags);
+        ESP_ERROR_CHECK(ioctl(uvc->cap_fd, VIDIOC_QBUF, &cap_buf));
+    }
+
+    video_stop_cb(uvc);
+    if (ret == ESP_OK) {
+        ESP_LOGW(TAG, "continuous-frame test passed: 5 complete frames");
+    }
+    return ret;
+}
+
 static esp_err_t init_uvc(p4_uvc_t *uvc)
 {
     const int index = 0;
@@ -1168,6 +1233,15 @@ void app_main(void)
         ESP_LOGE(TAG, "codec video init failed: %s", esp_err_to_name(ret));
         return;
     }
+
+#if P4SCAN_AUTO_CSI_TEST
+    ESP_LOGW(TAG, "automatic CSI continuous-frame test starting");
+    ret = run_csi_continuous_test(uvc);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "automatic CSI continuous-frame test failed: %s", esp_err_to_name(ret));
+        return;
+    }
+#endif
 
     ret = init_uvc(uvc);
     if (ret != ESP_OK) {

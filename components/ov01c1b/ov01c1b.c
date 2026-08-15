@@ -10,6 +10,7 @@
 #include "esp_cam_sensor.h"
 #include "esp_cam_sensor_detect.h"
 #include "esp_sccb_intf.h"
+#include "soc/mipi_csi_bridge_struct.h"
 #include "ov01c1b.h"
 #include "ov01c1b_settings.h"
 
@@ -262,6 +263,9 @@ static esp_err_t ov01c1b_set_stream(esp_cam_sensor_device_t *dev, int enable)
 #endif
 
     if (enable) {
+        MIPI_CSI_BRIDGE.dma_req_cfg.dma_burst_len = 512;
+        ESP_LOGI(TAG, "CSI bridge DMA burst length=512 cfg=0x%08x",
+                 (unsigned int)MIPI_CSI_BRIDGE.dma_req_cfg.val);
 #if CONFIG_CAMERA_OV01C1B_TEST_PATTERN
         /* The vendor sequence enables the pattern before MIPI output. */
         ESP_RETURN_ON_ERROR(ov01c1b_set_test_pattern(dev, true), TAG,
