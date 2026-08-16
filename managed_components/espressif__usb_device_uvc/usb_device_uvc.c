@@ -162,7 +162,7 @@ static void video_task(void *arg)
 
         if (!already_start) {
             already_start = 1;
-            start_ms = get_time_millis();
+            start_ms = get_time_millis() - s_uvc_device.interval_ms[0];
             ulTaskNotifyTake(pdTRUE, 0);
             ESP_LOGI(TAG, "UVC1 transfer notifications cleared");
         }

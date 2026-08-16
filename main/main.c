@@ -52,6 +52,7 @@
 #define P4SCAN_USE_ISP_RGB565_TEST 0
 #define P4SCAN_LOG_BUFFER_LAYOUT 1
 #define P4SCAN_AUTO_CSI_TEST 0
+#define P4SCAN_MAX_EMPTY_CAPTURE_FRAMES 4
 
 typedef struct {
     int cap_fd;
@@ -78,6 +79,8 @@ typedef struct {
     size_t pattern_len;
     uint32_t frame_count;
     bool streaming;
+    bool priming_frame;
+    bool primed_frame_ready;
     bool csi_only;
     SemaphoreHandle_t stream_lock;
 
@@ -85,6 +88,27 @@ typedef struct {
 } p4_uvc_t;
 
 static const char *TAG = "p4scan_uvc";
+
+static bool capture_frame_is_empty(const p4_uvc_t *uvc, const uint8_t *src, size_t src_len)
+{
+    if (!src || src_len == 0) {
+        return true;
+    }
+
+    if (uvc->capture_format == V4L2_PIX_FMT_SBGGR10) {
+        size_t expected_len = (size_t)uvc->capture_width * uvc->capture_height * 5 / 4;
+        if (src_len < expected_len) {
+            return true;
+        }
+    }
+
+    for (size_t i = 0; i < src_len; i++) {
+        if (src[i] != 0) {
+            return false;
+        }
+    }
+    return true;
+}
 
 static esp_err_t cache_msync_aligned(void *buffer, size_t length, uint32_t flags)
 {
@@ -644,6 +668,7 @@ static esp_err_t init_codec_video(p4_uvc_t *uvc)
 }
 
 static void video_stop_cb(void *cb_ctx);
+static uvc_fb_t *video_fb_get_cb(void *cb_ctx);
 
 static esp_err_t video_start_cb_internal(uvc_format_t uvc_format, int width, int height, int rate,
                                          void *cb_ctx, bool csi_only)
@@ -668,6 +693,8 @@ static esp_err_t video_start_cb_internal(uvc_format_t uvc_format, int width, int
     uvc->frame_count = 0;
     uvc->raw_compare_valid = false;
     uvc->capture_stream_stopped = false;
+    uvc->priming_frame = false;
+    uvc->primed_frame_ready = false;
     uvc->csi_only = csi_only;
 
 #if CONFIG_P4SCAN_UVC_TEST_PATTERN
@@ -850,8 +877,27 @@ static esp_err_t video_start_cb_internal(uvc_format_t uvc_format, int width, int
 
     log_buffer_layout(uvc);
 
-    uvc->streaming = true;
-    xSemaphoreGive(uvc->stream_lock);
+    if (!csi_only) {
+        ESP_LOGI(TAG, "UVC prewarming first frame");
+        uvc->priming_frame = true;
+        xSemaphoreGive(uvc->stream_lock);
+
+        uvc_fb_t *primed_frame = video_fb_get_cb(uvc);
+        if (primed_frame) {
+            uvc->primed_frame_ready = true;
+            uvc->streaming = true;
+            ESP_LOGI(TAG, "UVC first frame prewarmed: %u bytes",
+                     (unsigned int)primed_frame->len);
+        } else {
+            ESP_LOGW(TAG, "UVC first frame prewarm failed");
+            uvc->streaming = true;
+        }
+        uvc->priming_frame = false;
+        xSemaphoreGive(uvc->stream_lock);
+    } else {
+        uvc->streaming = true;
+        xSemaphoreGive(uvc->stream_lock);
+    }
     return ESP_OK;
 }
 
@@ -873,6 +919,8 @@ static void video_stop_cb(void *cb_ctx)
         return;
     }
     uvc->streaming = false;
+    uvc->priming_frame = false;
+    uvc->primed_frame_ready = false;
 
     int type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 #if !CONFIG_P4SCAN_UVC_TEST_PATTERN
@@ -947,29 +995,56 @@ static uvc_fb_t *video_fb_get_cb(void *cb_ctx)
     struct v4l2_buffer m2m_out_buf;
     struct v4l2_buffer m2m_cap_buf;
     const uint8_t *capture_frame = NULL;
+    uint32_t discarded_empty_frames = 0;
 
     xSemaphoreTake(uvc->stream_lock, portMAX_DELAY);
-    if (!uvc->streaming) {
+    if (!uvc->streaming && !uvc->priming_frame) {
         xSemaphoreGive(uvc->stream_lock);
         return NULL;
     }
 
+    if (uvc->primed_frame_ready) {
+        uvc->primed_frame_ready = false;
+        return &uvc->fb;
+    }
+
 #if !CONFIG_P4SCAN_UVC_TEST_PATTERN
-    memset(&cap_buf, 0, sizeof(cap_buf));
-    cap_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-    cap_buf.memory = V4L2_MEMORY_MMAP;
-    if (P4SCAN_VERBOSE_RAW_DIAGNOSTICS && uvc->frame_count < 8) {
-        ESP_LOGI(TAG, "CSI DQBUF wait: requested_frame=%u", (unsigned int)uvc->frame_count);
+    while (true) {
+        memset(&cap_buf, 0, sizeof(cap_buf));
+        cap_buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        cap_buf.memory = V4L2_MEMORY_MMAP;
+        if (P4SCAN_VERBOSE_RAW_DIAGNOSTICS && uvc->frame_count < 8) {
+            ESP_LOGI(TAG, "CSI DQBUF wait: requested_frame=%u", (unsigned int)uvc->frame_count);
+        }
+        ESP_ERROR_CHECK(ioctl(uvc->cap_fd, VIDIOC_DQBUF, &cap_buf));
+        if (P4SCAN_VERBOSE_RAW_DIAGNOSTICS && uvc->frame_count < 8) {
+            ESP_LOGI(TAG, "CSI DQBUF done: index=%u bytesused=%u",
+                     (unsigned int)cap_buf.index, (unsigned int)cap_buf.bytesused);
+        }
+        ESP_ERROR_CHECK(cache_msync_aligned(uvc->cap_buffer[cap_buf.index],
+                                            uvc->cap_buffer_len[cap_buf.index],
+                                            ESP_CACHE_MSYNC_FLAG_DIR_M2C));
+        capture_frame = uvc->cap_buffer[cap_buf.index];
+
+        bool empty_frame = capture_frame_is_empty(uvc, capture_frame, cap_buf.bytesused);
+        bool retry_empty_frame = empty_frame &&
+                                 (uvc->capture_format == V4L2_PIX_FMT_SBGGR10 ||
+                                  uvc->capture_format == V4L2_PIX_FMT_SBGGR8) &&
+                                 discarded_empty_frames < P4SCAN_MAX_EMPTY_CAPTURE_FRAMES;
+        if (!retry_empty_frame) {
+            if (empty_frame) {
+                ESP_LOGW(TAG, "CSI empty frame retry limit reached; accepting frame=%u",
+                         (unsigned int)uvc->frame_count);
+            }
+            break;
+        }
+
+        ESP_LOGW(TAG, "CSI empty frame discarded: index=%u bytesused=%u retry=%u",
+                 (unsigned int)cap_buf.index, (unsigned int)cap_buf.bytesused,
+                 (unsigned int)(discarded_empty_frames + 1));
+        ESP_ERROR_CHECK(ioctl(uvc->cap_fd, VIDIOC_QBUF, &cap_buf));
+        discarded_empty_frames++;
     }
-    ESP_ERROR_CHECK(ioctl(uvc->cap_fd, VIDIOC_DQBUF, &cap_buf));
-    if (P4SCAN_VERBOSE_RAW_DIAGNOSTICS && uvc->frame_count < 8) {
-        ESP_LOGI(TAG, "CSI DQBUF done: index=%u bytesused=%u",
-                 (unsigned int)cap_buf.index, (unsigned int)cap_buf.bytesused);
-    }
-    ESP_ERROR_CHECK(cache_msync_aligned(uvc->cap_buffer[cap_buf.index],
-                                        uvc->cap_buffer_len[cap_buf.index],
-                                        ESP_CACHE_MSYNC_FLAG_DIR_M2C));
-    capture_frame = uvc->cap_buffer[cap_buf.index];
 #if P4SCAN_STOP_CSI_BEFORE_JPEG
     {
         int capture_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
