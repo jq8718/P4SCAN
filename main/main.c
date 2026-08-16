@@ -355,11 +355,10 @@ static void unpack_raw10_to_raw8(const uint8_t *src, uint8_t *dst, int width, in
         uint8_t *dst_line = dst + (size_t)y * width;
         for (int x = 0; x < width; x += 4) {
             const uint8_t *group = src_line + (size_t)x / 4 * 5;
-            uint8_t low_bits = group[4];
-            dst_line[x + 0] = (uint8_t)((group[0] << 2) | ((low_bits >> 0) & 0x03));
-            dst_line[x + 1] = (uint8_t)((group[1] << 2) | ((low_bits >> 2) & 0x03));
-            dst_line[x + 2] = (uint8_t)((group[2] << 2) | ((low_bits >> 4) & 0x03));
-            dst_line[x + 3] = (uint8_t)((group[3] << 2) | ((low_bits >> 6) & 0x03));
+            dst_line[x + 0] = group[0];
+            dst_line[x + 1] = group[1];
+            dst_line[x + 2] = group[2];
+            dst_line[x + 3] = group[3];
         }
     }
 }
