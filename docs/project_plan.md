@@ -53,7 +53,7 @@ OV01C1B 的测试寄存器需要区分两种功能：
 - 规格书说明 ColorBar 的完整输出尺寸为 `1032x1032`，不能直接用普通 `1024x1024` CSI 配置验证；RAW10 单帧应为 `1,331,280` 字节。
 - 厂商代码中的 `P1:0xF0=0x04`、`P1:0xF3=0x03`、`P1:0x12=0x01` 属于 FSIN/EVSYNC 帧同步输出路径，不是 ColorBar 配置。
 
-ColorBar 仅用于 MIPI bring-up；当前默认配置关闭 `CONFIG_CAMERA_OV01C1B_TEST_PATTERN`，不写入 P4 ColorBar 寄存器，也不写入 P1 FSIN 配置。真实感光数据经 RAW10 解包为灰度 RGB565 后送入 JPEG 编码器。
+ColorBar 仅用于 MIPI bring-up；当前默认配置关闭 `CONFIG_CAMERA_OV01C1B_TEST_PATTERN`，不写入 P4 ColorBar 寄存器，也不写入 P1 FSIN 配置。真实感光数据当前走 `RAW10 -> ISP RAW8 -> CPU 灰度 RGB565 -> 硬件 JPEG`，再送入 UVC。硬件 JPEG 的单通道 GREY 输入对 1024x1024 图像曾出现半幅输出，因此暂不作为默认 UVC 路径。
 
 OV01C1B 是黑白传感器，正常输出应为单通道灰度图像，不应按彩色 Bayer 图像解释。
 

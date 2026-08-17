@@ -17,6 +17,8 @@
 typedef struct {
     uint32_t hmirror_en : 1;
     uint32_t vflip_en : 1;
+    uint16_t exposure;
+    uint16_t digital_gain;
 } ov01c1b_para_t;
 
 typedef struct {
@@ -25,6 +27,7 @@ typedef struct {
 
 #define delay_ms(ms) vTaskDelay(pdMS_TO_TICKS(ms))
 #define OV01C1B_MCLK (24 * 1000 * 1000)
+#define OV01C1B_GAIN_COUNT (OV01C1B_GAIN_MAX - OV01C1B_GAIN_MIN + 1)
 
 #if CONFIG_CAMERA_OV01C1B_COLORBAR_FULL_1032X1032
 #define OV01C1B_FORMAT_WIDTH  1032
@@ -37,6 +40,20 @@ typedef struct {
 #endif
 
 static const char *TAG = "ov01c1b";
+static uint32_t ov01c1b_gain_map[OV01C1B_GAIN_COUNT];
+static bool ov01c1b_gain_map_initialized;
+
+static void ov01c1b_init_gain_map(void)
+{
+    if (ov01c1b_gain_map_initialized) {
+        return;
+    }
+
+    for (size_t i = 0; i < ARRAY_SIZE(ov01c1b_gain_map); i++) {
+        ov01c1b_gain_map[i] = OV01C1B_GAIN_MIN + i;
+    }
+    ov01c1b_gain_map_initialized = true;
+}
 
 static esp_cam_sensor_bayer_pattern_t ov01c1b_get_bayer_pattern(void)
 {
@@ -206,6 +223,67 @@ static esp_err_t ov01c1b_set_test_pattern(esp_cam_sensor_device_t *dev, bool ena
     return ESP_OK;
 }
 
+static esp_err_t ov01c1b_select_page(esp_cam_sensor_device_t *dev, uint8_t page)
+{
+    return ov01c1b_write(dev->sccb_handle, OV01C1B_REG_PAGE_SEL, page);
+}
+
+static esp_err_t ov01c1b_trigger_exposure_gain(esp_cam_sensor_device_t *dev)
+{
+    return ov01c1b_write(dev->sccb_handle, OV01C1B_REG_CTRL, 0x01);
+}
+
+static esp_err_t ov01c1b_set_exposure(esp_cam_sensor_device_t *dev, uint32_t exposure)
+{
+    ov01c1b_cam_t *cam = (ov01c1b_cam_t *)dev->priv;
+
+    if (exposure < OV01C1B_EXP_MIN || exposure > OV01C1B_EXP_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ESP_RETURN_ON_ERROR(ov01c1b_select_page(dev, 0x01), TAG, "failed to select page 1 for exposure");
+    ESP_RETURN_ON_ERROR(ov01c1b_write(dev->sccb_handle, OV01C1B_REG_EXP_H,
+                                      (uint8_t)(exposure >> 8)), TAG, "failed to write exposure high");
+    ESP_RETURN_ON_ERROR(ov01c1b_write(dev->sccb_handle, OV01C1B_REG_EXP_L,
+                                      (uint8_t)exposure), TAG, "failed to write exposure low");
+    ESP_RETURN_ON_ERROR(ov01c1b_trigger_exposure_gain(dev), TAG, "failed to trigger exposure");
+    ESP_RETURN_ON_ERROR(ov01c1b_select_page(dev, 0x00), TAG, "failed to restore page 0 after exposure");
+
+    cam->para.exposure = (uint16_t)exposure;
+    ESP_LOGD(TAG, "exposure=%u Tline", (unsigned int)exposure);
+    return ESP_OK;
+}
+
+static esp_err_t ov01c1b_set_digital_gain(esp_cam_sensor_device_t *dev, uint32_t gain)
+{
+    ov01c1b_cam_t *cam = (ov01c1b_cam_t *)dev->priv;
+    uint32_t raw_gain;
+    uint8_t gain_msb;
+
+    ov01c1b_init_gain_map();
+    if (gain >= ARRAY_SIZE(ov01c1b_gain_map)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    raw_gain = ov01c1b_gain_map[gain];
+    gain_msb = (uint8_t)(raw_gain >> 8);
+    ESP_RETURN_ON_ERROR(ov01c1b_select_page(dev, 0x01), TAG, "failed to select page 1 for gain");
+    ESP_RETURN_ON_ERROR(ov01c1b_write(dev->sccb_handle, OV01C1B_REG_DIG_GAIN,
+                                      (uint8_t)raw_gain), TAG, "failed to write digital gain");
+    ESP_RETURN_ON_ERROR(ov01c1b_write(dev->sccb_handle, OV01C1B_REG_DIG_GAIN2,
+                                      (uint8_t)raw_gain), TAG, "failed to write digital gain2");
+    ESP_RETURN_ON_ERROR(ov01c1b_write(dev->sccb_handle, OV01C1B_REG_DIG_GAIN_M,
+                                      (uint8_t)(gain_msb | (gain_msb << 4))), TAG,
+                        "failed to write digital gain MSB");
+    ESP_RETURN_ON_ERROR(ov01c1b_trigger_exposure_gain(dev), TAG, "failed to trigger gain");
+    ESP_RETURN_ON_ERROR(ov01c1b_select_page(dev, 0x00), TAG, "failed to restore page 0 after gain");
+
+    cam->para.digital_gain = (uint16_t)gain;
+    ESP_LOGI(TAG, "digital gain index=%u raw=0x%03x (%u/64)",
+             (unsigned int)gain, (unsigned int)raw_gain, (unsigned int)raw_gain);
+    return ESP_OK;
+}
+
 static esp_err_t ov01c1b_set_colorbar_mipi_size(esp_cam_sensor_device_t *dev)
 {
     ESP_RETURN_ON_ERROR(ov01c1b_write(dev->sccb_handle, OV01C1B_REG_PAGE_SEL, 0x00), TAG,
@@ -319,6 +397,20 @@ static esp_err_t ov01c1b_query_para_desc(esp_cam_sensor_device_t *dev, esp_cam_s
     (void)dev;
 
     switch (qdesc->id) {
+    case ESP_CAM_SENSOR_GAIN:
+        ov01c1b_init_gain_map();
+        qdesc->type = ESP_CAM_SENSOR_PARAM_TYPE_ENUMERATION;
+        qdesc->enumeration.count = ARRAY_SIZE(ov01c1b_gain_map);
+        qdesc->enumeration.elements = ov01c1b_gain_map;
+        qdesc->default_value = 0;
+        return ESP_OK;
+    case ESP_CAM_SENSOR_EXPOSURE_VAL:
+        qdesc->type = ESP_CAM_SENSOR_PARAM_TYPE_NUMBER;
+        qdesc->number.minimum = OV01C1B_EXP_MIN;
+        qdesc->number.maximum = OV01C1B_EXP_MAX;
+        qdesc->number.step = 1;
+        qdesc->default_value = OV01C1B_EXP_DEFAULT;
+        return ESP_OK;
     case ESP_CAM_SENSOR_VFLIP:
     case ESP_CAM_SENSOR_HMIRROR:
         qdesc->type = ESP_CAM_SENSOR_PARAM_TYPE_NUMBER;
@@ -339,6 +431,12 @@ static esp_err_t ov01c1b_get_para_value(esp_cam_sensor_device_t *dev, uint32_t i
     ESP_RETURN_ON_FALSE(size == sizeof(uint32_t), ESP_ERR_INVALID_ARG, TAG, "parameter size error");
 
     switch (id) {
+    case ESP_CAM_SENSOR_GAIN:
+        *(uint32_t *)arg = cam->para.digital_gain;
+        return ESP_OK;
+    case ESP_CAM_SENSOR_EXPOSURE_VAL:
+        *(uint32_t *)arg = cam->para.exposure;
+        return ESP_OK;
     case ESP_CAM_SENSOR_VFLIP:
         *(uint32_t *)arg = cam->para.vflip_en;
         return ESP_OK;
@@ -353,10 +451,20 @@ static esp_err_t ov01c1b_get_para_value(esp_cam_sensor_device_t *dev, uint32_t i
 static esp_err_t ov01c1b_set_para_value(esp_cam_sensor_device_t *dev, uint32_t id, const void *arg, size_t size)
 {
     ov01c1b_cam_t *cam = (ov01c1b_cam_t *)dev->priv;
+    uint32_t value;
 
     ESP_RETURN_ON_FALSE(size == sizeof(uint32_t) || size == sizeof(int), ESP_ERR_INVALID_ARG, TAG, "parameter size error");
-    uint32_t value = *(const uint32_t *)arg ? 1 : 0;
 
+    switch (id) {
+    case ESP_CAM_SENSOR_GAIN:
+        return ov01c1b_set_digital_gain(dev, *(const uint32_t *)arg);
+    case ESP_CAM_SENSOR_EXPOSURE_VAL:
+        return ov01c1b_set_exposure(dev, *(const uint32_t *)arg);
+    default:
+        break;
+    }
+
+    value = *(const uint32_t *)arg ? 1 : 0;
     switch (id) {
     case ESP_CAM_SENSOR_VFLIP:
         cam->para.vflip_en = value;
@@ -523,6 +631,9 @@ esp_cam_sensor_device_t *ov01c1b_detect(esp_cam_sensor_config_t *config)
     dev->ops = &ov01c1b_ops;
     dev->priv = cam;
     dev->cur_format = &ov01c1b_format_info[CONFIG_CAMERA_OV01C1B_MIPI_IF_FORMAT_INDEX_DEFAULT];
+    cam->para.exposure = OV01C1B_EXP_DEFAULT;
+    ov01c1b_init_gain_map();
+    cam->para.digital_gain = 0;
 
     if (ov01c1b_power_on(dev) != ESP_OK) {
         goto failed;

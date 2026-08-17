@@ -188,7 +188,7 @@ static void video_task(void *arg)
             ++frame_num;
             tx_busy = 0;
             tx_start_ms = 0;
-            ESP_LOGI(TAG, "UVC1 transfer idle, requesting next frame=%" PRIu32, frame_num);
+            ESP_LOGD(TAG, "UVC1 transfer idle, requesting next frame=%" PRIu32, frame_num);
         }
 
         start_ms += s_uvc_device.interval_ms[0];
@@ -338,7 +338,7 @@ void tud_video_frame_xfer_complete_cb(uint_fast8_t ctl_idx, uint_fast8_t stm_idx
 {
     (void)ctl_idx;
     (void)stm_idx;
-    ESP_LOGI(TAG, "UVC%u transfer complete", (unsigned int)ctl_idx + 1);
+    ESP_LOGD(TAG, "UVC%u transfer complete", (unsigned int)ctl_idx + 1);
     xTaskNotifyGive(s_uvc_device.uvc_task_hdl[ctl_idx]);
 }
 

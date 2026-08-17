@@ -23,6 +23,7 @@
 #include "esp_timer.h"
 #include "example_video_common.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/semphr.h"
 #include "usb_device_uvc.h"
 #include "uvc_frame_config.h"
@@ -44,15 +45,60 @@
 #endif
 
 #define BUFFER_COUNT        2
-#define P4SCAN_FW_MARK      "ov01c1b-raw10-synthetic-input-20260815"
+#define P4SCAN_FW_MARK      "ov01c1b-isp-raw8-rgb565-jpeg-20260817"
 #define P4SCAN_CACHE_LINE   64
 #define P4SCAN_VERBOSE_RAW_DIAGNOSTICS 1
 #define P4SCAN_RAW8_SYNTHETIC_TEST 0
 #define P4SCAN_STOP_CSI_BEFORE_JPEG 0
 #define P4SCAN_USE_ISP_RGB565_TEST 0
+#define P4SCAN_USE_ISP_RAW8_RGB565 1
 #define P4SCAN_LOG_BUFFER_LAYOUT 1
 #define P4SCAN_AUTO_CSI_TEST 0
 #define P4SCAN_MAX_EMPTY_CAPTURE_FRAMES 4
+#define P4SCAN_FRAME_LOG_INTERVAL 50
+
+static const char *TAG = "p4scan_uvc";
+
+#if CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
+static void cpu_usage_task(void *arg)
+{
+    (void)arg;
+    uint64_t previous_idle0 = 0;
+    uint64_t previous_idle1 = 0;
+    int64_t previous_time_us = 0;
+
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        uint64_t idle0 = (uint64_t)ulTaskGetIdleRunTimeCounterForCore(0);
+        uint64_t idle1 = (uint64_t)ulTaskGetIdleRunTimeCounterForCore(1);
+        int64_t current_time_us = esp_timer_get_time();
+        if (previous_time_us == 0) {
+            previous_idle0 = idle0;
+            previous_idle1 = idle1;
+            previous_time_us = current_time_us;
+            continue;
+        }
+
+        uint64_t interval_us = (uint64_t)(current_time_us - previous_time_us);
+        uint64_t idle0_us = idle0 - previous_idle0;
+        uint64_t idle1_us = idle1 - previous_idle1;
+        uint32_t idle_percent0 = interval_us ? (uint32_t)(idle0_us * 100 / interval_us) : 100;
+        uint32_t idle_percent1 = interval_us ? (uint32_t)(idle1_us * 100 / interval_us) : 100;
+        idle_percent0 = idle_percent0 > 100 ? 100 : idle_percent0;
+        idle_percent1 = idle_percent1 > 100 ? 100 : idle_percent1;
+        uint32_t load0 = 100 - idle_percent0;
+        uint32_t load1 = 100 - idle_percent1;
+        uint32_t load_avg = (load0 + load1) / 2;
+
+        ESP_LOGI(TAG, "CPU load(1s): core0=%u%% core1=%u%% average=%u%%",
+                 (unsigned int)load0, (unsigned int)load1, (unsigned int)load_avg);
+        previous_idle0 = idle0;
+        previous_idle1 = idle1;
+        previous_time_us = current_time_us;
+    }
+}
+#endif
 
 typedef struct {
     int cap_fd;
@@ -86,8 +132,6 @@ typedef struct {
 
     uvc_fb_t fb;
 } p4_uvc_t;
-
-static const char *TAG = "p4scan_uvc";
 
 static bool capture_frame_is_empty(const p4_uvc_t *uvc, const uint8_t *src, size_t src_len)
 {
@@ -438,6 +482,49 @@ static void log_raw8_diagnostics(const uint8_t *src, size_t len, int width, int 
     (void)height;
 }
 
+static void log_jpeg_header(const uint8_t *jpeg, size_t len)
+{
+    size_t pos = 2;
+
+    while (pos + 9 < len) {
+        if (jpeg[pos] != 0xff) {
+            pos++;
+            continue;
+        }
+        while (pos < len && jpeg[pos] == 0xff) {
+            pos++;
+        }
+        if (pos >= len || jpeg[pos] == 0xd8 || jpeg[pos] == 0xd9) {
+            continue;
+        }
+        uint8_t marker = jpeg[pos++];
+        if (marker >= 0xd0 && marker <= 0xd7) {
+            continue;
+        }
+        if (pos + 2 > len) {
+            return;
+        }
+        uint16_t segment_len = ((uint16_t)jpeg[pos] << 8) | jpeg[pos + 1];
+        if (segment_len < 2 || pos + segment_len > len) {
+            return;
+        }
+        if ((marker >= 0xc0 && marker <= 0xc3) || (marker >= 0xc5 && marker <= 0xc7) ||
+            (marker >= 0xc9 && marker <= 0xcb) || (marker >= 0xcd && marker <= 0xcf)) {
+            uint16_t height = ((uint16_t)jpeg[pos + 3] << 8) | jpeg[pos + 4];
+            uint16_t width = ((uint16_t)jpeg[pos + 5] << 8) | jpeg[pos + 6];
+            uint8_t components = jpeg[pos + 7];
+            ESP_LOGI(TAG, "JPEG SOF: marker=0x%02x width=%u height=%u components=%u",
+                     marker, width, height, components);
+            for (uint8_t i = 0; i < components && pos + 9 + (size_t)i * 3 < len; i++) {
+                ESP_LOGI(TAG, "JPEG SOF component=%u id=%u sampling=0x%02x table=%u",
+                         i, jpeg[pos + 8 + i * 3], jpeg[pos + 9 + i * 3], jpeg[pos + 10 + i * 3]);
+            }
+            return;
+        }
+        pos += segment_len;
+    }
+}
+
 static void set_capture_frame_rate(int fd, int rate)
 {
     struct v4l2_streamparm parm = {
@@ -750,10 +837,18 @@ static esp_err_t video_start_cb_internal(uvc_format_t uvc_format, int width, int
     capture_fmt = V4L2_PIX_FMT_RGB565;
     encoder_input_fmt = V4L2_PIX_FMT_RGB565;
     ESP_LOGI(TAG, "ISP path test: CSI RAW10 -> ISP RGB565 -> JPEG");
-#else
+#elif P4SCAN_USE_ISP_RAW8_RGB565
+    capture_fmt = V4L2_PIX_FMT_SBGGR8;
+    encoder_input_fmt = V4L2_PIX_FMT_RGB565;
+    ESP_LOGI(TAG, "ISP path test: CSI RAW10 -> ISP RAW8 -> CPU RGB565 -> JPEG");
+#elif CONFIG_P4SCAN_CSI_RAW10_BYPASS_ISP
     capture_fmt = V4L2_PIX_FMT_SBGGR10;
     encoder_input_fmt = V4L2_PIX_FMT_RGB565;
     ESP_LOGI(TAG, "mono path: CSI RAW10 -> RAW10 unpack -> grayscale RGB565 -> JPEG");
+#else
+    capture_fmt = V4L2_PIX_FMT_SBGGR8;
+    encoder_input_fmt = V4L2_PIX_FMT_GREY;
+    ESP_LOGI(TAG, "ISP path test: CSI RAW10 -> ISP RAW8 -> grayscale JPEG");
 #endif
 
     memset(&format, 0, sizeof(format));
@@ -789,10 +884,13 @@ static esp_err_t video_start_cb_internal(uvc_format_t uvc_format, int width, int
                                                                MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM | MALLOC_CAP_CACHE_ALIGNED);
             ESP_RETURN_ON_FALSE(uvc->raw_compare_buffer, ESP_ERR_NO_MEM, TAG, "failed to allocate RAW10 compare buffer");
         }
-        uvc->raw565_buffer_len = (size_t)uvc->capture_width * uvc->capture_height * 2;
-        uvc->raw565_buffer = heap_caps_aligned_alloc(128, uvc->raw565_buffer_len,
-                                                     MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM | MALLOC_CAP_CACHE_ALIGNED);
-        ESP_RETURN_ON_FALSE(uvc->raw565_buffer, ESP_ERR_NO_MEM, TAG, "failed to allocate RGB565 conversion buffer");
+        if (capture_fmt == V4L2_PIX_FMT_SBGGR10 ||
+            (capture_fmt == V4L2_PIX_FMT_SBGGR8 && encoder_input_fmt == V4L2_PIX_FMT_RGB565)) {
+            uvc->raw565_buffer_len = (size_t)uvc->capture_width * uvc->capture_height * 2;
+            uvc->raw565_buffer = heap_caps_aligned_alloc(128, uvc->raw565_buffer_len,
+                                                         MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM | MALLOC_CAP_CACHE_ALIGNED);
+            ESP_RETURN_ON_FALSE(uvc->raw565_buffer, ESP_ERR_NO_MEM, TAG, "failed to allocate RGB565 conversion buffer");
+        }
     }
     set_capture_frame_rate(uvc->cap_fd, rate);
 
@@ -990,6 +1088,7 @@ static void video_stop_cb(void *cb_ctx)
 static uvc_fb_t *video_fb_get_cb(void *cb_ctx)
 {
     p4_uvc_t *uvc = (p4_uvc_t *)cb_ctx;
+    int64_t pipeline_start_us = esp_timer_get_time();
     struct v4l2_format format;
     struct v4l2_buffer cap_buf;
     struct v4l2_buffer m2m_out_buf;
@@ -1097,12 +1196,12 @@ static uvc_fb_t *video_fb_get_cb(void *cb_ctx)
                                          ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED));
         m2m_out_buf.m.userptr = (unsigned long)uvc->raw565_buffer;
         m2m_out_buf.length = uvc->raw565_buffer_len;
-    } else if (uvc->capture_format == V4L2_PIX_FMT_SBGGR8) {
+    } else if (uvc->capture_format == V4L2_PIX_FMT_SBGGR8 && uvc->raw565_buffer) {
         if (uvc->frame_count < 2) {
             log_raw8_diagnostics(uvc->cap_buffer[cap_buf.index], cap_buf.bytesused,
                                  uvc->capture_width, uvc->capture_height);
         }
-        convert_raw8_to_rgb565(uvc->cap_buffer[cap_buf.index], uvc->raw565_buffer,
+        convert_raw8_to_rgb565(capture_frame, uvc->raw565_buffer,
                                uvc->capture_width, uvc->capture_height);
         ESP_ERROR_CHECK(esp_cache_msync(uvc->raw565_buffer, uvc->raw565_buffer_len,
                                         ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED));
@@ -1147,6 +1246,7 @@ static uvc_fb_t *video_fb_get_cb(void *cb_ctx)
                  uvc->m2m_cap_buffer[26], uvc->m2m_cap_buffer[27],
                  uvc->m2m_cap_buffer[28], uvc->m2m_cap_buffer[29],
                  uvc->m2m_cap_buffer[30], uvc->m2m_cap_buffer[31]);
+        log_jpeg_header(uvc->m2m_cap_buffer, m2m_cap_buf.bytesused);
     }
 
 #if !CONFIG_P4SCAN_UVC_TEST_PATTERN
@@ -1174,13 +1274,19 @@ static uvc_fb_t *video_fb_get_cb(void *cb_ctx)
     uvc->fb.timestamp.tv_usec = us % 1000000UL;
 
     uvc->frame_count++;
+    int64_t pipeline_us = esp_timer_get_time() - pipeline_start_us;
+    if ((uvc->frame_count % P4SCAN_FRAME_LOG_INTERVAL) == 0) {
+        ESP_LOGI(TAG, "pipeline: frame=%u duration=%lld us jpeg=%u bytes",
+                 (unsigned int)(uvc->frame_count - 1), (long long)pipeline_us,
+                 (unsigned int)uvc->fb.len);
+    }
     if (P4SCAN_VERBOSE_RAW_DIAGNOSTICS && uvc->frame_count <= 8) {
         ESP_LOGI(TAG, "JPEG fingerprint: frame=%u crc=%08x len=%u",
                  (unsigned int)(uvc->frame_count - 1),
                  (unsigned int)esp_rom_crc32_le(0, uvc->fb.buf, uvc->fb.len),
                  (unsigned int)uvc->fb.len);
     }
-    if ((uvc->frame_count % 1) == 0) {
+    if ((uvc->frame_count % P4SCAN_FRAME_LOG_INTERVAL) == 0) {
         ESP_LOGI(TAG, "UVC frame ready: %ux%u %s, %u bytes, head=%02x%02x tail=%02x%02x",
                  uvc->fb.width,
                  uvc->fb.height,
@@ -1211,6 +1317,7 @@ static void video_fb_return_cb(uvc_fb_t *fb, void *cb_ctx)
     xSemaphoreGive(uvc->stream_lock);
 }
 
+#if P4SCAN_AUTO_CSI_TEST
 static esp_err_t run_csi_continuous_test(p4_uvc_t *uvc)
 {
     esp_err_t ret = video_start_cb_internal(UVC_FORMAT_JPEG, 1024, 1024, 2, uvc, true);
@@ -1248,6 +1355,7 @@ static esp_err_t run_csi_continuous_test(p4_uvc_t *uvc)
     }
     return ret;
 }
+#endif
 
 static esp_err_t init_uvc(p4_uvc_t *uvc)
 {
@@ -1317,4 +1425,11 @@ void app_main(void)
         ESP_LOGE(TAG, "UVC init failed: %s", esp_err_to_name(ret));
         return;
     }
+
+#if CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS
+    BaseType_t task_ret = xTaskCreate(cpu_usage_task, "cpu_usage", 3072, NULL, 1, NULL);
+    if (task_ret != pdPASS) {
+        ESP_LOGW(TAG, "CPU usage monitor task creation failed");
+    }
+#endif
 }
